@@ -3,10 +3,7 @@ package com.ericwadkins.audioanalyzer;
 import javax.sound.sampled.*;
 import javax.swing.*;
 import java.awt.*;
-import java.awt.event.ComponentEvent;
-import java.awt.event.ComponentListener;
-import java.awt.event.WindowAdapter;
-import java.awt.event.WindowEvent;
+import java.awt.event.*;
 import java.util.ArrayList;
 import java.util.HashMap;
 
@@ -16,10 +13,10 @@ import java.util.HashMap;
 public class Analyzer {
 
     // Display settings
-    public static final int WIDTH = 1024;
-    public static final int HEIGHT = 375;
+    public static int width = 1024;
+    public static int height = 375;
     public static final int COLOR_SPECTRUMS = 4;
-    public static final int BASELINE = 30;
+    public static final int BASELINE = 50;
 
     public static final int DISPLAY_FPS = 10; // Lower if data is not showing properly
 
@@ -27,8 +24,8 @@ public class Analyzer {
     public static final int SAMPLES_PER_SECOND = 8192; // Linearly shifts frequencies to the left (wider frequency range)
     public static final int UPDATES_PER_SECOND = 8; // Linearly decreases data points (-), decreases update time (+)
 
-    // com.ericwadkins.audioanalyzer.Analyzer settings
-    public static final double MAX_VALUE = 200.0;
+    // Analyzer settings
+    public static final double MAX_VALUE = 250.0;
     public static final double BASS_UPPER_BOUND = 0.04 * (8192.0 / SAMPLES_PER_SECOND);
 
     public static final int STACK_SIZE = 10;
@@ -59,10 +56,21 @@ public class Analyzer {
             e.printStackTrace();
         }
 
-        start(line, format);
+        SerialComm comm = new SerialComm("/dev/cu.usbmodem1421", 9600);
+        try {
+            comm.start();
+        } catch (Exception e) {
+            System.out.println("WARNING: Failed to create serial comm");
+            comm = null;
+        }
+
+        System.out.println("\n***********************");
+        System.out.println("Starting Audio Analyzer");
+        System.out.println("***********************\n");
+        start(line, format, comm);
     }
 
-    public static void start(TargetDataLine line, AudioFormat format) {
+    public static void start(TargetDataLine line, AudioFormat format, SerialComm comm) {
         // Create display
         int display = createDisplay();
 
@@ -73,16 +81,81 @@ public class Analyzer {
         line.start();
 
         ArrayList<Frame> stack = new ArrayList<>(STACK_SIZE);
+        int lastHue = -1;
+        int lastSaturation = -1;
+        int lastBrightness = -1;
+        int sentCount = 0;
         while (true) {
+            // Read data from the data line
             int n = line.read(raw, 0, raw.length);
 
+            // Process the raw data
             Frame frame = process(raw, stack);
 
+            // Analyze the processed data, modifies and returns frame
+            frame = analyze(frame);
+
+            FrameEvent event = new FrameEvent();
+
+            int hue = (int) ((((double) frame.peakAverage * COLOR_SPECTRUMS / frame.processed.length) % 1) * 360);
+            int saturation = 100; // full color
+            int brightness = 50;
+            if (frame.maxBassIntensityDifference > 0.05) {
+                brightness = (int) (50 + frame.maxBassIntensityDifference * 50);
+                System.out.println(frame.maxBassIntensityDifference);
+                if (frame.maxBassIntensityDifference > 0.4) {
+                    saturation = 0; // white
+                }
+            }
+
+            if (hue != lastHue) {
+                event.changeHue(hue);
+                lastHue = hue;
+            }
+            if (saturation != lastSaturation) {
+                event.changeSaturation(saturation);
+                lastSaturation = saturation;
+            }
+            if (brightness != lastBrightness) {
+                event.changeBrightness(brightness);
+                lastBrightness = brightness;
+            }
+
+            // If something has changed
+            if (event.getType() > 0) {
+                sentCount++;
+                byte[] bytes = event.getBytes();
+                System.out.print("Packet " + sentCount + ": ");
+                for (int i = bytes.length - 1; i >= 0; i--) {
+                    byte b = bytes[i];
+                    for (int j = 0; j < 8; j++) {
+                        System.out.print((b & (1 << (7 - j))) != 0 ? 1 : 0);
+                    }
+                    System.out.print(" ");
+                }
+                System.out.println();
+                /*System.out.print("Extracted ");
+                int[] values = FrameEvent.extract(bytes);
+                for (int v : values) {
+                    System.out.print(v + " ");
+                }
+                System.out.println();
+                System.out.println();*/
+
+                // Send over serial comm
+                if (comm != null) {
+                    comm.send(bytes);
+                }
+            }
+
+
+            // Add the frame to the stack for the next frame
             if (stack.size() == STACK_SIZE) {
                 stack.remove(0);
             }
             stack.add(frame);
 
+            // Update the data to be displayed
             updateDisplay(display, frame);
             count++;
             //System.out.println(count);
@@ -92,11 +165,6 @@ public class Analyzer {
     public static Frame process(byte[] raw, ArrayList<Frame> stack) {
         Frame frame = new Frame();
         frame.stack = new ArrayList<>(stack);
-
-        Frame last = null;
-        if (stack.size() > 0) {
-            last = stack.get(stack.size() - 1);
-        }
 
         // Raw data
         frame.raw = raw;
@@ -114,8 +182,23 @@ public class Analyzer {
         for (int i = 0; i < stack.size(); i++) {
             processed = scaleSurrounding(processed, stack.get(i).peakAverage, 1 + Math.pow(0.5, stack.size() - i), 10);
         }
+        // Normalize to range [0,1]
+        processed = limit(processed, MAX_VALUE);
+        processed = scaleRange(processed, 0, 1.0, 1.0 / MAX_VALUE);
 
         frame.processed = processed;
+
+        return frame;
+    }
+
+    public static Frame analyze(Frame frame) {
+
+        double[] processed = frame.processed;
+
+        Frame last = null;
+        if (frame.stack.size() > 0) {
+            last = frame.stack.get(frame.stack.size() - 1);
+        }
 
         double sum = 0.0;
         double bassSum = 0.0;
@@ -185,7 +268,7 @@ public class Analyzer {
             peakTotal += processed[i] * mult;
             peakWeightedTotal += processed[i] * mult * i;
         }
-        if (peakTotal < 10) {
+        if (peakTotal < 0.05) {
             peakWeightedTotal = 0;
         }
         frame.peakAverage = (int) (peakWeightedTotal / peakTotal);
@@ -203,15 +286,13 @@ public class Analyzer {
 
             frame.averageBassIntensityDifference = frame.averageBassIntensity - last.averageBassIntensity;
             frame.averageBassIntensityGain = (frame.averageBassIntensityDifference) / last.averageBassIntensity;
-            
+
             frame.maxIntensityDifference = frame.maxIntensity - last.maxIntensity;
             frame.maxIntensityGain = (frame.maxIntensityDifference) / last.maxIntensity;
 
             frame.maxBassIntensityDifference = frame.maxBassIntensity - last.maxBassIntensity;
             frame.maxBassIntensityGain = (frame.maxBassIntensityDifference) / last.maxBassIntensity;
         }
-
-        //System.out.println(frame.maxBassIntensityGain);
 
         return frame;
     }
@@ -292,6 +373,14 @@ public class Analyzer {
         return processed;
     }
 
+    public static double[] limit(double[] data, double limit) {
+        double[] processed = new double[data.length];
+        for (int i = 0; i < data.length; i++) {
+            processed[i] = Math.min(limit, data[i]);
+        }
+        return processed;
+    }
+
     public static double[] calculateFFT(byte[] signal) {
         final int mNumberOfFFTPoints = signal.length / 2;
         double mMaxFFTSample = 0.0;
@@ -323,8 +412,8 @@ public class Analyzer {
         idCount++;
         openCount++;
         final int id = idCount;
-        JFrame mainFrame = new JFrame(title == null ? "Audio com.ericwadkins.audioanalyzer.Analyzer " + id : title);
-        mainFrame.setSize(WIDTH, HEIGHT + 22);
+        JFrame mainFrame = new JFrame(title == null ? "Audio Analyzer " + id : title);
+        mainFrame.setSize(width, height + 22);
         mainFrame.setLayout(new GridLayout(3, 1));
         JPanel controlPanel = new JPanel();
         controlPanel.setLayout(new FlowLayout());
@@ -333,15 +422,20 @@ public class Analyzer {
         mainFrame.setVisible(true);
         Canvas canvas = new Canvas();
         canvas.setBackground(Color.BLACK);
-        canvas.setSize(WIDTH, HEIGHT);
+        canvas.setSize(width, height);
         controlPanel.add(canvas);
 
         mainFrame.addComponentListener(new ComponentListener() {
             @Override
             public void componentResized(ComponentEvent e) {
-                //System.out.println(mainFrame.getWidth());
-                //System.out.println(mainFrame.getHeight());
-                //canvas.setSize(mainFrame.getWidth(), mainFrame.getHeight());
+                System.out.println(canvas.getWidth());
+                System.out.println(canvas.getHeight());
+                System.out.println(mainFrame.getWidth());
+                System.out.println(mainFrame.getHeight());
+                width = mainFrame.getWidth();
+                height = mainFrame.getHeight();
+                canvas.setSize(mainFrame.getWidth(), mainFrame.getHeight());
+                canvas.repaint();
             }
             @Override
             public void componentMoved(ComponentEvent e) {
@@ -386,6 +480,22 @@ public class Analyzer {
                 display.interrupt(); // Use to kill thread
             }
         });
+        KeyListener exit = new KeyListener() {
+            @Override
+            public void keyTyped(KeyEvent e) {
+                if (e.getExtendedKeyCode() == 27) {
+                    System.exit(0);
+                }
+            }
+            @Override
+            public void keyPressed(KeyEvent e) {
+            }
+            @Override
+            public void keyReleased(KeyEvent e) {
+            }
+        };
+        mainFrame.addKeyListener(exit);
+        canvas.addKeyListener(exit);
 
         return id;
     }
@@ -397,71 +507,61 @@ public class Analyzer {
     public static void displayData(int id, Frame frame) {
         Graphics2D g = (Graphics2D) canvasMap.get(id).getGraphics();
         g.setStroke(new BasicStroke(2));
-        g.clearRect(0, 0, WIDTH, HEIGHT);
-        double xScale = (double) WIDTH / frame.processed.length;
-        double yScale = (HEIGHT - BASELINE) / MAX_VALUE;
+        g.clearRect(0, 0, width, height);
+        double xScale = (double) width / frame.processed.length;
+        double yScale = height - BASELINE;
         int lastX = 0;
-        int lastY = HEIGHT - BASELINE;
+        int lastY = height - BASELINE;
         //String style = "rect";
         String style = "line";
 
         //g.setColor(Color.getHSBColor(0.0f, 1.0f, 0.2f));
-        //g.fillRect(0, 0, (int) (data.length * xScale * BASS_UPPER_BOUND), HEIGHT);
+        //g.fillRect(0, 0, (int) (data.length * xScale * BASS_UPPER_BOUND), height);
 
-        if (frame.maxBassIntensityGain > 0.2 && frame.maxBassIntensityDifference > 10) {
-            g.setColor(Color.getHSBColor(0.0f, 0.0f, (float) (0.2 * frame.maxBassIntensityDifference / 10)));
-            g.fillRect(0, 0, WIDTH, HEIGHT);
-            System.out.print("Blink " + count + " ");
-            for (int i = 0; i < 0.2 * frame.maxBassIntensityDifference; i++) {
-                System.out.print("#");
-            }
-            System.out.println();
+        if (frame.maxBassIntensityDifference > 0.05) {
+            float brightness = (float) frame.maxBassIntensityDifference;
+            g.setColor(Color.getHSBColor(0.0f, frame.maxBassIntensityDifference > 0.4 ? 1.0f : 0.0f, brightness));
+            g.fillRect(0, 0, width, height);
         }
-
-        if (frame.maxBassIntensityGain > 5 && frame.maxBassIntensityDifference > 20) {
-            g.setColor(Color.getHSBColor(0.0f, 1.0f, (float) (Math.max(0.4, 0.2 * frame.maxBassIntensityDifference / 10))));
-            g.fillRect(0, 0, WIDTH, HEIGHT);
-        }
-
         g.setColor(Color.getHSBColor(0.0f, 0.0f, 1.0f));
-        g.drawRect(0, (HEIGHT - BASELINE), WIDTH, 1);
+        g.drawRect(0, (height - BASELINE), width, 1);
 
         g.setColor(Color.getHSBColor(0.0f, 0.0f, 0.5f));
-        g.drawRect(0, (HEIGHT - BASELINE) - (int) ((frame.maxIntensity + 2) * yScale),
+        g.drawRect(0, (height - BASELINE) - (int) ((frame.maxIntensity + 0.01) * yScale),
                 (int) (frame.processed.length * xScale), 3);
 
         g.setColor(Color.getHSBColor(0.0f, 1.0f, 0.5f));
-        g.drawRect(0, (HEIGHT - BASELINE) - (int) ((frame.maxBassIntensity + 2) * yScale),
+        g.drawRect(0, (height - BASELINE) - (int) ((frame.maxBassIntensity + 0.01) * yScale),
                 (int) (frame.processed.length * BASS_UPPER_BOUND * xScale), 3);
 
         g.setColor(Color.getHSBColor(0.0f, 0.0f, 0.5f));
-        g.fillRect(0, (HEIGHT - BASELINE) - (int) ((frame.averageIntensity + 2) * yScale),
+        g.fillRect(0, (height - BASELINE) - (int) ((frame.averageIntensity + 0.01) * yScale),
                 (int) (frame.processed.length * xScale), 3);
 
         g.setColor(Color.getHSBColor(0.0f, 1.0f, 0.5f));
-        g.fillRect(0, (HEIGHT - BASELINE) - (int) ((frame.averageBassIntensity + 2) * yScale),
+        g.fillRect(0, (height - BASELINE) - (int) ((frame.averageBassIntensity + 0.01) * yScale),
                 (int) (frame.processed.length * BASS_UPPER_BOUND * xScale), 3);
 
         for (int p = 0; p < frame.peaks.length; p++) {
             int i = frame.peaks[p];
             g.setColor(Color.getHSBColor(((float) i * COLOR_SPECTRUMS / frame.processed.length) % 1, 1.0f, 1.0f));
-            g.fillRect((int) (i * xScale), HEIGHT - (int) (frame.processed[i] * yScale),
-                    (int) xScale, BASELINE + (int) (frame.processed[i] * yScale));
+            g.fillRect((int) (i * xScale), (height - BASELINE) - (int) (frame.processed[i] * yScale),
+                    (int) xScale, /*BASELINE +*/ (int) (frame.processed[i] * yScale));
         }
 
         g.setColor(Color.getHSBColor(((float) frame.peakAverage * COLOR_SPECTRUMS / frame.processed.length) % 1, 1.0f, 1.0f));
-        g.fillRect((int) (frame.peakAverage * xScale), 0, (int) xScale, HEIGHT - BASELINE);
-        //g.fillRect(0, 0, WIDTH, HEIGHT);
+        g.drawRect((int) (frame.peakAverage * xScale - 1), 0, 3, height);
+        //g.fillRect(0, 0, width, height);
 
         for (int i = 0; i < frame.processed.length; i++) {
             g.setColor(Color.getHSBColor(((float) i * COLOR_SPECTRUMS / frame.processed.length) % 1, 1.0f, 1.0f));
             int x = (int) (i * xScale);
-            int y = (int) ((HEIGHT - BASELINE) - Math.max(1, (int) (frame.processed[i] * yScale)));
+            int y = (int) ((height - BASELINE) - Math.max(1, (int) (frame.processed[i] * yScale)));
             if (style == "line") {
                 g.drawLine(lastX, lastY, x, y);
             }
             else if (style == "rect") {
-                g.fillRect(x, y, (int) xScale, (HEIGHT - BASELINE) - y);
+                g.fillRect(x, y, (int) xScale, (height - BASELINE) - y);
             }
             lastX = x;
             lastY = y;
@@ -486,6 +586,8 @@ public class Analyzer {
         System.err.println();
     }
 
+    // Shell classes for data storage
+
     static class Frame {
         public byte[] raw;
         public double[] frequencies;
@@ -506,6 +608,146 @@ public class Analyzer {
         public int[] peaks;
         public int peakAverage;
         public ArrayList<Frame> stack;
+    }
+
+    static class FrameEvent {
+        private static final int HUE_CHANGE = 1;
+        private static final int SATURATION_CHANGE = 2;
+        private static final int BRIGHTNESS_CHANGE = 4;
+
+        private static final int TYPE_LOAD_SIZE = 3;
+        private static final int HUE_LOAD_SIZE = 9;
+        private static final int SATURATION_LOAD_SIZE = 7;
+        private static final int BRIGHTNESS_LOAD_SIZE = 7;
+
+        private int type;
+        private int hue;
+        private int saturation;
+        private int brightness;
+
+        public void changeHue(int hue) {
+            if (hue < 0 || hue > 359) {
+                throw new IllegalArgumentException("Hue must be in the range 0-359");
+            }
+            this.hue = hue;
+            type |= HUE_CHANGE;
+        }
+
+        public void changeSaturation(int saturation) {
+            if (saturation < 0 || saturation > 100) {
+                throw new IllegalArgumentException("Saturation must be in the range 0-100");
+            }
+            this.saturation = saturation;
+            type |= SATURATION_CHANGE;
+        }
+
+        public void changeBrightness(int brightness) {
+            if (brightness < 0 || brightness > 100) {
+                throw new IllegalArgumentException("Brightness must be in the range 0-100");
+            }
+            this.brightness = brightness;
+            type |= BRIGHTNESS_CHANGE;
+        }
+
+        public int getType() {
+            return type;
+        }
+
+        public byte[] getBytes() {
+            int bitCount = TYPE_LOAD_SIZE;
+            boolean hueChange = (type & HUE_CHANGE) == HUE_CHANGE;
+            boolean saturationChange = (type & SATURATION_CHANGE) == SATURATION_CHANGE;
+            boolean brightnessChange = (type & BRIGHTNESS_CHANGE) == BRIGHTNESS_CHANGE;
+            if (hueChange) {
+                bitCount += HUE_LOAD_SIZE;
+            }
+            if (saturationChange) {
+                bitCount += SATURATION_LOAD_SIZE;
+            }
+            if (brightnessChange) {
+                bitCount += BRIGHTNESS_LOAD_SIZE;
+            }
+            int byteCount = bitCount / 8;
+            if (bitCount % 8 != 0) {
+                byteCount++;
+            }
+            //System.out.println("Event requires " + bitCount + " bits -> " + byteCount + " bytes");
+
+            byte[] bytes = new byte[byteCount];
+
+            int[] packed = new int[2];
+            packed = pack(bytes, packed[0], packed[1], TYPE_LOAD_SIZE, type);
+            if (hueChange) {
+                packed = pack(bytes, packed[0], packed[1], HUE_LOAD_SIZE, hue);
+            }
+            if (saturationChange) {
+                packed = pack(bytes, packed[0], packed[1], SATURATION_LOAD_SIZE, saturation);
+            }
+            if (brightnessChange) {
+                packed = pack(bytes, packed[0], packed[1], BRIGHTNESS_LOAD_SIZE, brightness);
+            }
+
+            return bytes;
+        }
+
+        public static int[] extract(byte[] bytes) {
+            int type = -1;
+            int hue = -1;
+            int saturation = -1;
+            int brightness = -1;
+            int[] unpacked = new int[3];
+            unpacked = unpack(bytes, unpacked[1], unpacked[2], TYPE_LOAD_SIZE);
+            type = unpacked[0];
+            if ((type & HUE_CHANGE) == HUE_CHANGE) {
+                unpacked = unpack(bytes, unpacked[1], unpacked[2], HUE_LOAD_SIZE);
+                hue = unpacked[0];
+            }
+            if ((type & SATURATION_CHANGE) == SATURATION_CHANGE) {
+                unpacked = unpack(bytes, unpacked[1], unpacked[2], SATURATION_LOAD_SIZE);
+                saturation = unpacked[0];
+            }
+            if ((type & BRIGHTNESS_CHANGE) == BRIGHTNESS_CHANGE) {
+                unpacked = unpack(bytes, unpacked[1], unpacked[2], BRIGHTNESS_LOAD_SIZE);
+                brightness = unpacked[0];
+            }
+
+            return new int[] {type, hue, saturation, brightness};
+        }
+
+        private static int[] unpack(byte[] bytes, int byteIndex, int bitIndex, int loadSize) {
+            int val = 0;
+            for (int i = 0; i < loadSize; i++) {
+                if (bitIndex > 7) {
+                    bitIndex = 0;
+                    byteIndex++;
+                }
+                val |= (((bytes[byteIndex] & (1 << bitIndex)) >> bitIndex) << i);
+                bitIndex++;
+            }
+            return new int[] {val, byteIndex, bitIndex};
+        }
+
+        private static int[] pack(byte[] bytes, int byteIndex, int bitIndex, int loadSize, int val) {
+            for (int i = 0; i < loadSize; i++) {
+                if (bitIndex > 7) {
+                    bitIndex = 0;
+                    byteIndex++;
+                }
+                if ((val & (1 << i)) != 0) {
+                    bytes[byteIndex] |= (1 << bitIndex);
+                }
+                bitIndex++;
+            }
+            return new int[] {byteIndex, bitIndex};
+        }
+
+        private static boolean isSet(byte b, int bit) {
+            return (b & (1 << bit)) != 0;
+        }
+
+        private static byte set(byte b, int bit) {
+            return (byte) (b | (1 << bit));
+        }
     }
 
 }
